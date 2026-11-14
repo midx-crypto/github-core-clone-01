@@ -626,8 +626,13 @@ function findPullByGlobalId(ctx: Ctx, id: string): { repo: Repo; pull: Pull } | 
 /** Squash-merge a pull request; returns the merge commit oid or null on conflict. */
 export function squashMerge(store: Store, repo: Repo, pull: Pull): string | null {
   if (pull.merged) return pull.mergeCommitSha;
+  // The base tip is read live from the ref, not from the sha captured when
+  // the pull was opened: another pull may have merged into the base since.
+  // Using the stale sha would compare against the old tree (so a real
+  // conflict reads as clean) and parent the squash commit on the old tip.
+  const currentBaseSha = repo.refs.get(`refs/heads/${pull.base}`) ?? pull.baseSha;
   const headObj = repo.objects.get(pull.headSha);
-  const baseObj = repo.objects.get(pull.baseSha);
+  const baseObj = repo.objects.get(currentBaseSha);
   if (headObj === undefined || baseObj === undefined) return null;
   const headTree = parseCommitObj(headObj.data).tree;
   const baseTree = parseCommitObj(baseObj.data).tree;
@@ -654,7 +659,7 @@ export function squashMerge(store: Store, repo: Repo, pull: Pull): string | null
   const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.head}\n\n${pull.title}\n`;
   const stamp = store.nextTimestamp();
   const commitData = Buffer.from(
-    `tree ${tree}\nparent ${pull.baseSha}\nauthor ada iversen <adaiversen@example.invalid> ${stamp} +0000\ncommitter ada iversen <adaiversen@example.invalid> ${stamp} +0000\n\n${message}`,
+    `tree ${tree}\nparent ${currentBaseSha}\nauthor ada iversen <adaiversen@example.invalid> ${stamp} +0000\ncommitter ada iversen <adaiversen@example.invalid> ${stamp} +0000\n\n${message}`,
     'utf8',
   );
   const oid = hashOf('commit', commitData);

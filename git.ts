@@ -416,6 +416,26 @@ interface FetchPlan {
   depth: number | null;
 }
 
+/** The tree and blob oids under one tree, without following any commit. */
+function treeClosure(objects: ReadonlyMap<string, GitObj>, treeOid: string): Set<string> {
+  const out = new Set<string>();
+  const stack = [treeOid];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (out.has(oid)) continue;
+    const obj = objects.get(oid);
+    if (obj === undefined || obj.type !== 'tree') continue;
+    out.add(oid);
+    for (const entry of parseTree(obj.data)) {
+      const member = objects.get(entry.oid);
+      if (member === undefined) continue;
+      if (member.type === 'tree') stack.push(entry.oid);
+      else if (member.type === 'blob') out.add(entry.oid);
+    }
+  }
+  return out;
+}
+
 function planFetch(repo: Repo, plan: FetchPlan): { objects: GitObj[]; shallow: string[]; unshallow: string[] } {
   const dist = commitDistances(repo.objects, plan.wants);
   const maxDepth = plan.depth === null ? Infinity : plan.depth;
@@ -454,12 +474,10 @@ function planFetch(repo: Repo, plan: FetchPlan): { objects: GitObj[]; shallow: s
       if (obj.type !== 'commit') continue;
       if (haveSet.has(oid)) continue;
       send.add(oid);
-      const closure = collectReachable(repo.objects, [oid]);
-      for (const member of closure) {
-        // The commit's own tree/blobs; parent commits are their own entries.
-        const memberObj = repo.objects.get(member);
-        if (memberObj !== undefined && memberObj.type !== 'commit') send.add(member);
-      }
+      // The commit's own tree and blobs only: collectReachable would follow
+      // parent links and pull in the whole history's trees and blobs, which
+      // is what a shallow fetch must not do.
+      for (const member of treeClosure(repo.objects, parseCommit(obj.data).tree)) send.add(member);
     }
     // Wanted tag objects themselves (clone wants include tag oids).
     for (const want of plan.wants) {

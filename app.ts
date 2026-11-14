@@ -540,7 +540,8 @@ function handleCommits(res: ServerResponse, repo: Repo, query: URLSearchParams):
     return {
       sha: oid,
       commit: {
-        message: commit.message,
+        // GitHub's API trims the trailing newline the git object carries.
+        message: commit.message.replace(/\n+$/, ''),
         author: { name: author, email: emailMatch?.[1] ?? VIEWER_EMAIL, date: new Date(commit.timestamp * 1000).toISOString() },
         committer: { name: author, email: emailMatch?.[1] ?? VIEWER_EMAIL, date: new Date(commit.timestamp * 1000).toISOString() },
         tree: { sha: commit.tree },
