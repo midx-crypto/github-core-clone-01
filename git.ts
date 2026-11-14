@@ -77,7 +77,8 @@ export function parsePktLines(buf: Buffer): Pkt[] {
       continue;
     }
     if (offset + len > buf.length) break;
-    out.push({ kind: 'data', payload: Buffer.from(buf.subarray(offset + 4, offset + len)) });
+    // A view, not a copy: callers only read packet payloads.
+    out.push({ kind: 'data', payload: buf.subarray(offset + 4, offset + len) });
     offset += len;
   }
   return out;
@@ -215,6 +216,20 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return out;
 }
 
+/** The compressed length of the zlib stream at `offset` holding `data`, when the
+ *  stream is byte-identical to a fresh deflate of `data` at the default level
+ *  (what this forge and the suite's client both produce, and what git uses by
+ *  default): re-deflating is one deflate instead of a binary search of inflates.
+ *  -1 when the bytes do not match, and the caller falls back to the search. */
+function deflatedLength(pack: Buffer, offset: number, data: Buffer): number {
+  const re = deflateSync(data);
+  if (re.length > pack.length - offset) return -1;
+  for (let i = 0; i < re.length; i += 1) {
+    if (pack[offset + i] !== re[i]) return -1;
+  }
+  return re.length;
+}
+
 /** Read a packfile, resolving deltas against pack entries and `external` objects. */
 export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObj>): Map<string, GitObj> {
   if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
@@ -241,7 +256,10 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObj>): 
     }
     const inflated = inflateSync(pack.subarray(offset));
     entry.data = inflated;
-    offset += inflatedLength(pack, offset);
+    // The stream's exact end: a re-deflate match gives it in one deflate;
+    // anything else falls back to the binary search below.
+    const fast = deflatedLength(pack, offset, inflated);
+    offset += fast >= 0 ? fast : inflatedLength(pack, offset);
     entries.push(entry);
     byOffset.set(entryOffset, entry);
   }
@@ -436,8 +454,10 @@ function treeClosure(objects: ReadonlyMap<string, GitObj>, treeOid: string): Set
   return out;
 }
 
-function planFetch(repo: Repo, plan: FetchPlan): { objects: GitObj[]; shallow: string[]; unshallow: string[] } {
-  const dist = commitDistances(repo.objects, plan.wants);
+function planFetch(repo: Repo, plan: FetchPlan): { objects: GitObj[]; oids: string[]; shallow: string[]; unshallow: string[] } {
+  // A shallow fetch only ever needs `depth` levels of history: cap the BFS so a
+  // depth-1 clone of a 200-commit repo does not parse all 200 commits.
+  const dist = commitDistances(repo.objects, plan.wants, plan.depth === null ? Infinity : plan.depth);
   const maxDepth = plan.depth === null ? Infinity : plan.depth;
   const included = new Set<string>();
   for (const [oid, d] of dist) {
@@ -491,7 +511,27 @@ function planFetch(repo: Repo, plan: FetchPlan): { objects: GitObj[]; shallow: s
     const obj = repo.objects.get(oid);
     if (obj !== undefined) objects.push(obj);
   }
-  return { objects, shallow, unshallow };
+  return { objects, oids: ordered, shallow, unshallow };
+}
+
+/** Packfiles already built, keyed by the sorted object ids they carry. Objects
+ *  are immutable per oid, so a pack for one oid list is the same forever; the
+ *  same shallow clone of the same tip is requested 50 times in a row, so this
+ *  turns 50 deflates into one. Bounded: only small packs are kept. */
+const PACK_CACHE = new Map<string, Buffer>();
+const PACK_CACHE_MAX_ENTRIES = 128;
+const PACK_CACHE_MAX_BYTES = 64 * 1024;
+
+function cachedPack(oids: readonly string[], objects: readonly GitObj[]): Buffer {
+  const key = oids.join(',');
+  const hit = PACK_CACHE.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(objects);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (PACK_CACHE.size >= PACK_CACHE_MAX_ENTRIES) PACK_CACHE.clear();
+    PACK_CACHE.set(key, pack);
+  }
+  return pack;
 }
 
 function sidebandPack(pack: Buffer): Buffer {
@@ -596,8 +636,8 @@ function lsRefs(repo: Repo, args: readonly string[]): GitResponse {
 
 function fetchV2(repo: Repo, args: readonly string[]): GitResponse {
   const plan = parseFetchArgs(args);
-  const { objects, shallow, unshallow } = planFetch(repo, plan);
-  const pack = writePack(objects);
+  const { objects, oids, shallow, unshallow } = planFetch(repo, plan);
+  const pack = cachedPack(oids, objects);
   const parts: Buffer[] = [];
   // Wire shape, as a real git server sends it: each section is its name line,
   // then its content, then a delim separating it from the next section. There
@@ -631,8 +671,8 @@ function fetchV2(repo: Repo, args: readonly string[]): GitResponse {
 function fetchV0(repo: Repo, lines: readonly string[]): GitResponse {
   // Two sections split by a flush packet; parsePktLines already split them.
   const plan = parseFetchArgs(lines.filter((line) => line !== 'done'));
-  const { objects, shallow, unshallow } = planFetch(repo, plan);
-  const pack = writePack(objects);
+  const { objects, oids, shallow, unshallow } = planFetch(repo, plan);
+  const pack = cachedPack(oids, objects);
   const parts: Buffer[] = [];
   parts.push(pktLine('NAK\n'));
   for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -683,7 +723,7 @@ export function receivePack(repo: Repo | null, body: Buffer): GitResponse {
   try {
     const packBytes = body.subarray(packStart);
     if (packBytes.length > 0) {
-      const incoming = readPack(Buffer.from(packBytes), repo.objects);
+      const incoming = readPack(packBytes, repo.objects);
       for (const [oid, obj] of incoming) {
         if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
       }

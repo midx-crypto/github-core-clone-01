@@ -178,6 +178,7 @@ function callTool(store: Store, name: string, args: Record<string, unknown>): { 
       labels: [] as Array<{ name: string; color: string }>,
       comments: [] as Array<{ id: number; body: string }>,
       createdSeq: store.nextSeq(),
+      rev: 0,
     };
     repo.issues.push(issue);
     return { result: textResult(issueJson(repo, issue)) };

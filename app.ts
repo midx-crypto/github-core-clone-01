@@ -19,7 +19,7 @@ import {
   type Store,
 } from './store.ts';
 import { Store as StoreClass } from './store.ts';
-import { flattenTree, parseCommit, treeFromFiles } from './store.ts';
+import { flattenTree, parseCommit, touchIssue, treeFromFiles } from './store.ts';
 import { infoRefs, receivePack, uploadPack } from './git.ts';
 import { executeGraphQL, squashMerge } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
@@ -36,12 +36,14 @@ function nextRequestId(): string {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = body === null ? '' : `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId(), ...headers });
+  // An explicit content-length keeps Node from falling back to chunked framing:
+  // one writev, and the client knows the body size up front.
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId(), 'content-length': Buffer.byteLength(text), ...headers });
   res.end(text);
 }
 
 function sendNoContent(res: ServerResponse): void {
-  res.writeHead(204, { 'x-github-request-id': nextRequestId() });
+  res.writeHead(204, { 'x-github-request-id': nextRequestId(), 'content-length': 0 });
   res.end();
 }
 
@@ -52,9 +54,11 @@ function sendError(res: ServerResponse, status: number, message: string): void {
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let size = 0;
     req.on('data', (chunk: Buffer) => {
       chunks.push(chunk);
-      if (chunks.reduce((sum, part) => sum + part.length, 0) > 64 * 1024 * 1024) {
+      size += chunk.length;
+      if (size > 64 * 1024 * 1024) {
         reject(new Error('body too large'));
       }
     });
@@ -70,27 +74,77 @@ interface ParsedUrl {
 }
 
 function parseUrl(req: IncomingMessage): ParsedUrl {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    const pathname = url.pathname;
-    const segments = pathname.split('/').filter((part) => part !== '').map((part) => {
-      try {
-        return decodeURIComponent(part);
-      } catch {
-        return part;
-      }
-    });
-    return { pathname, segments, query: url.searchParams };
-  } catch {
-    return { pathname: '/', segments: [], query: new URLSearchParams() };
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const pathname = q === -1 ? raw : raw.slice(0, q);
+  // Dot segments are the one case the fast split mishandles; fall back to URL.
+  if (pathname.includes('/./') || pathname.includes('/../') || pathname.endsWith('/.') || pathname.endsWith('/..')) {
+    try {
+      const url = new URL(raw, 'http://entry');
+      return {
+        pathname: url.pathname,
+        segments: url.pathname.split('/').filter((part) => part !== '').map((part) => {
+          try {
+            return decodeURIComponent(part);
+          } catch {
+            return part;
+          }
+        }),
+        query: url.searchParams,
+      };
+    } catch {
+      return { pathname: '/', segments: [], query: new URLSearchParams() };
+    }
   }
+  const segments = pathname.split('/').filter((part) => part !== '').map((part) => {
+    if (!part.includes('%')) return part;
+    try {
+      return decodeURIComponent(part);
+    } catch {
+      return part;
+    }
+  });
+  let query: URLSearchParams;
+  try {
+    query = q === -1 ? new URLSearchParams() : new URLSearchParams(raw.slice(q + 1));
+  } catch {
+    query = new URLSearchParams();
+  }
+  return { pathname, segments, query };
 }
+
+/** The bearer token never changes during the process: build its header once. */
+let expectedAuthHeader: string | null = null;
 
 function authorized(req: IncomingMessage): boolean {
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   if (expected === '') return true;
+  if (expectedAuthHeader === null) expectedAuthHeader = `Bearer ${expected}`;
   const header = req.headers.authorization ?? '';
-  return header === `Bearer ${expected}`;
+  return header === expectedAuthHeader;
+}
+
+/**
+ * An issue's serialized JSON, cached until the issue mutates. issueJson rebuilds
+ * node_id (base64), two ISO dates and the whole object on every read; the read
+ * workload GETs the same issue 2,000 times, and everything in the JSON except
+ * title/body/state/labels/comments-count is fixed at creation. The revision lives
+ * on the issue itself (store.ts `rev`, bumped by `touchIssue` at every mutation
+ * site in REST, GraphQL and MCP), so a stale entry is impossible while it matches.
+ */
+const issueJsonCache = new WeakMap<object, { rev: number; text: string }>();
+
+function issueJsonText(repo: Repo, issue: Parameters<typeof issueJson>[1]): string {
+  const cached = issueJsonCache.get(issue);
+  if (cached !== undefined && cached.rev === issue.rev) return cached.text;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issueJsonCache.set(issue, { rev: issue.rev, text });
+  return text;
+}
+
+function sendJsonText(res: ServerResponse, status: number, text: string): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId(), 'content-length': Buffer.byteLength(text) });
+  res.end(text);
 }
 
 function parseJsonBody(raw: Buffer): { ok: true; value: Record<string, unknown> } | { ok: false } {
@@ -325,9 +379,10 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, res
         labels: names.map((name) => repo.labels.get(name)!),
         comments: [] as Array<{ id: number; body: string }>,
         createdSeq: STORE.nextSeq(),
+        rev: 0,
       };
       repo.issues.push(issue);
-      sendJson(res, 201, issueJson(repo, issue));
+      sendJsonText(res, 201, issueJsonText(repo, issue));
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -352,6 +407,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, res
       repo.commentSeq += 1;
       const comment = { id: repo.commentSeq, body: asString(body.body) };
       issue.comments.push(comment);
+      touchIssue(issue);
       sendJson(res, 201, { id: comment.id, body: comment.body, user: { login: VIEWER_LOGIN, id: VIEWER_ID } });
       return;
     }
@@ -367,14 +423,15 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, res
     return;
   }
   if (method === 'GET') {
-    sendJson(res, 200, issueJson(repo, issue));
+    sendJsonText(res, 200, issueJsonText(repo, issue));
     return;
   }
   if (method === 'PATCH') {
     if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
     if (typeof body.title === 'string') issue.title = body.title;
     if (typeof body.body === 'string') issue.body = body.body;
-    sendJson(res, 200, issueJson(repo, issue));
+    touchIssue(issue);
+    sendJsonText(res, 200, issueJsonText(repo, issue));
     return;
   }
   sendError(res, 404, 'Not Found');

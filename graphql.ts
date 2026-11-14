@@ -12,7 +12,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { commitDistances, flattenTree, parseCommit } from './store.ts';
+import { commitDistances, flattenTree, parseCommit, touchIssue } from './store.ts';
 
 // -------------------------------------------------------------------------------------------
 // Parser
@@ -695,6 +695,7 @@ function executeMutation(ctx: Ctx, sel: Selection): Record<string, unknown> {
       labels: [],
       comments: [],
       createdSeq: ctx.store.nextSeq(),
+      rev: 0,
     };
     repo.issues.push(issue);
     const out: Record<string, unknown> = {};
@@ -710,6 +711,7 @@ function executeMutation(ctx: Ctx, sel: Selection): Record<string, unknown> {
       return { [key]: null };
     }
     found.issue.state = 'closed';
+    touchIssue(found.issue);
     const out: Record<string, unknown> = {};
     for (const sub of sel.selections) {
       if (sub.name === 'issue') out[sub.alias ?? sub.name] = resolveIssue(ctx, found.repo, found.issue, sub.selections);
@@ -772,6 +774,7 @@ function executeMutation(ctx: Ctx, sel: Selection): Record<string, unknown> {
     found.repo.commentSeq += 1;
     const comment = { id: found.repo.commentSeq, body: typeof input.body === 'string' ? input.body : '' };
     found.issue.comments.push(comment);
+    touchIssue(found.issue);
     const node = { id: ctx.store.globalId('comment', `${found.repo.owner}/${found.repo.name}:${found.issue.number}:${comment.id}`), body: comment.body };
     const out: Record<string, unknown> = {};
     for (const sub of sel.selections) {

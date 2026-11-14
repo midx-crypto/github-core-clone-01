@@ -183,8 +183,11 @@ export function flattenTree(objects: ReadonlyMap<string, GitObj>, treeOid: strin
   }
 }
 
-/** Commit distances (BFS over parents) from a set of tips; -1 means unreachable. */
-export function commitDistances(objects: ReadonlyMap<string, GitObj>, tips: Iterable<string>): Map<string, number> {
+/** Commit distances (BFS over parents) from a set of tips; -1 means unreachable.
+ *  `maxDepth` caps the search: nodes at distance >= maxDepth are never expanded
+ *  (and nodes past it never enter the map). Callers that only need the first
+ *  `depth` levels (a shallow fetch) pass it to avoid walking the whole history. */
+export function commitDistances(objects: ReadonlyMap<string, GitObj>, tips: Iterable<string>, maxDepth: number = Infinity): Map<string, number> {
   const dist = new Map<string, number>();
   const queue: string[] = [];
   for (const tip of tips) {
@@ -196,18 +199,21 @@ export function commitDistances(objects: ReadonlyMap<string, GitObj>, tips: Iter
   }
   for (let i = 0; i < queue.length; i += 1) {
     const oid = queue[i]!;
+    const d = dist.get(oid)!;
     const obj = objects.get(oid);
     if (obj === undefined) continue;
     if (obj.type === 'tag') {
+      // A tag's target sits at the tag's own distance, so it is always in range.
       const target = parseTag(obj.data).object;
       if (!dist.has(target)) {
-        dist.set(target, dist.get(oid)!);
+        dist.set(target, d);
         queue.push(target);
       }
       continue;
     }
     if (obj.type !== 'commit') continue;
-    const d = dist.get(oid)!;
+    // Parents sit one level deeper; never expand past the cap.
+    if (d + 1 >= maxDepth) continue;
     for (const parent of parseCommit(obj.data).parents) {
       if (!dist.has(parent)) {
         dist.set(parent, d + 1);
@@ -280,11 +286,30 @@ export function mergeBase(objects: ReadonlyMap<string, GitObj>, a: string, b: st
   return best;
 }
 
-/** Is `ancestor` reachable from `tip` (first-parent and merges alike)? */
+/** Is `ancestor` reachable from `tip` (first-parent and merges alike)?
+ *  Walks parent links from the tip and stops the moment the ancestor is found,
+ *  so the common fast-forward case (the ancestor is the tip's own parent) costs
+ *  one commit parse instead of a BFS over the whole history. */
 export function isAncestor(objects: ReadonlyMap<string, GitObj>, ancestor: string, tip: string): boolean {
   if (ancestor === ZERO_OID) return true;
   if (ancestor === tip) return true;
-  return commitDistances(objects, [tip]).has(ancestor);
+  const seen = new Set<string>();
+  const stack: string[] = [tip];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (oid === ancestor) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = objects.get(oid);
+    if (obj === undefined) continue;
+    if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+      continue;
+    }
+    if (obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -310,6 +335,13 @@ export interface Issue {
   labels: IssueLabel[];
   comments: IssueComment[];
   createdSeq: number;
+  /** Bumped on every mutation; caches of the serialized issue key off it. */
+  rev: number;
+}
+
+/** Mark an issue mutated, invalidating any cached serialization of it. */
+export function touchIssue(issue: Issue): void {
+  issue.rev += 1;
 }
 
 export interface Pull {
